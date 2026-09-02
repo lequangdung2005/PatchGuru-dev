@@ -37,7 +37,7 @@ docker run -t -d --name marshmallow-dev1 \
 # container's global site-packages, so installing against either tree once
 # (here, pre_version) satisfies that for the whole container.
 docker exec -w /pre_version/marshmallow marshmallow-dev1 pip install -e '.[dev]'
-docker exec -w /pre_version/marshmallow marshmallow-dev1 pip install coverage
+docker exec -w /pre_version/marshmallow marshmallow-dev1 pip install coverage pytest packaging
 echo "Done with first clone"
 
 #####
@@ -55,7 +55,7 @@ docker run -t -d --name marshmallow-dev2 \
     -v "${PWD}/post_version/marshmallow:/post_version/marshmallow" \
     python:3.12
 docker exec -w /pre_version/marshmallow marshmallow-dev2 pip install -e '.[dev]'
-docker exec -w /pre_version/marshmallow marshmallow-dev2 pip install coverage
+docker exec -w /pre_version/marshmallow marshmallow-dev2 pip install coverage pytest packaging
 echo "Done with second clone"
 
 echo "Creating third clone of marshmallow"
@@ -72,7 +72,7 @@ docker run -t -d --name marshmallow-dev3 \
     -v "${PWD}/post_version/marshmallow:/post_version/marshmallow" \
     python:3.12
 docker exec -w /pre_version/marshmallow marshmallow-dev3 pip install -e '.[dev]'
-docker exec -w /pre_version/marshmallow marshmallow-dev3 pip install coverage
+docker exec -w /pre_version/marshmallow marshmallow-dev3 pip install coverage pytest packaging
 echo "Done with third clone"
 
 cd "$REPO_ROOT"

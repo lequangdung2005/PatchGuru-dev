@@ -79,8 +79,12 @@ class ClonedRepoManager:
             1, self.nb_clones + 1)]  # last = last used
 
         # Per-clone lock file paths backing the lease API (fcntl.flock-based).
+        # Scoped by repo_name so concurrent batches for different projects
+        # (which share the same pool_dir) don't contend for the same 3 flock
+        # slots -- each project gets its own 3-slot exclusivity.
         self._clone_lock_paths: Dict[str, str] = {
-            f"clone{i}": f"{self.pool_dir}/clone{i}/.lock" for i in range(1, self.nb_clones + 1)
+            f"clone{i}": f"{self.pool_dir}/clone{i}/_{self.repo_name}.lock"
+            for i in range(1, self.nb_clones + 1)
         }
 
         # Lease bookkeeping is purely in-memory (not persisted to disk),

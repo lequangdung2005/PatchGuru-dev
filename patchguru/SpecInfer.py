@@ -335,6 +335,13 @@ def error_repair(
     try:
         cloned_repo = cloned_repo_manager.get_cloned_repo(pr.pre_commit, pr.post_commit, lease_token=lease_token)
         executor = DockerExecutor(container_name=cloned_repo.container_name)
+        # Rename projects configured with rebuild_per_pr (pandas, scipy, keras)
+        # build their pre_<pkg>/post_<pkg> wheels from the clone slot's
+        # /pre_version and /post_version checkouts. Rebuild them now that this
+        # slot is pinned to this PR's commits (marker-deduped, ccache-warm) so
+        # every executed pre_<pkg>/post_<pkg> reflects the analyzed commits, not
+        # the container-build-time snapshot.
+        executor.rebuild_wheels_if_stale(pr.pre_commit, pr.post_commit)
         specification = states["specification"]
         if states["stage"] != "error_repair":
             states["stage"] = "error_repair"

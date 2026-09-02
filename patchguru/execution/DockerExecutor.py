@@ -96,6 +96,60 @@ class DockerExecutor:
         output = exec_result.output.decode("utf-8")
         exit_code = exec_result.exit_code
         return exit_code, output
+
+    def rebuild_wheels_if_stale(self, pre_commit: str, post_commit: str, timeout: int = 1800) -> None:
+        """Rebuild the pre_<pkg>/post_<pkg> wheels for the container's current checkout.
+
+        For projects configured with ``rebuild_per_pr`` (see Config.PROJECT_CONFIGS),
+        the installed renamed wheels only reflect the analyzed commits if they are
+        rebuilt after the clone slot's /pre_version and /post_version checkouts are
+        re-checked out for a PR. Clone leases (ClonedRepoManager.acquire_clone_lease)
+        guarantee one PR at a time per container, so running this on a leased slot is
+        race-safe even across the parallel batch.
+
+        Idempotent per (pre_commit, post_commit): a marker file
+        ``/root/.pre_post_rebuilt_<pre>_<post>`` records that this container already
+        carries wheels built from that commit pair, so repeated per-function repair
+        sessions within one PR (or repeat PRs over the same pair) skip the
+        (expensive) rebuild. Non-rebuild projects return immediately.
+
+        Raises:
+            RuntimeError: If the in-container rebuild fails.
+        """
+        project = _resolve_project(self.container.name)
+        config = Config.PROJECT_CONFIGS.get(project) if project else None
+        if not config or not config.get("rebuild_per_pr"):
+            return
+
+        marker = f"/root/.pre_post_rebuilt_{pre_commit}_{post_commit}"
+        if self.container.exec_run(f"test -f {marker}").exit_code == 0:
+            return
+
+        conda_env = config.get("conda_env")
+        rename_script = config["rename_script"]
+        if conda_env:
+            command = (
+                f"bash -c 'source /root/conda/etc/profile.d/conda.sh"
+                f" && eval \"$(mamba shell hook --shell bash)\" && mamba activate {conda_env}"
+                f" && timeout {timeout}s bash /root/{rename_script}"
+                f" && touch {marker}"
+                f" && echo REBUILD_OK marker={marker}'"
+            )
+        else:
+            command = (
+                f"bash -c 'timeout {timeout}s bash /root/{rename_script}"
+                f" && touch {marker}"
+                f" && echo REBUILD_OK marker={marker}'"
+            )
+        result = self.container.exec_run(command)
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"Failed to rebuild renamed wheels for {project} "
+                f"({pre_commit}..{post_commit}): "
+                f"{result.output.decode('utf-8', errors='replace')[-4000:]}"
+            )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Execute Python code in a Docker container for a given PR.")
     parser.add_argument("--repo", required=True, help="Repository name (e.g., keras)")

@@ -60,24 +60,41 @@ class PullRequest:
 
             self._pr_url_to_patch()
             self._compute_non_test_modified_files()
-            self._compute_modified_lines()
 
-            self.has_non_comment_change = self.count_non_comment_change() > 0
+            # Pin a clone slot for the whole extraction window below. Everything
+            # after this point reads files straight out of the clone working
+            # trees (count_non_comment_change, get_changed_function_info,
+            # get_changed_file_contents), and ClonedRepoManager.get_cloned_repo
+            # drops the slot lock *before* those reads happen -- so a concurrent
+            # batch PR could re-check-out this slot mid-extraction and corrupt
+            # the cached fut_info (see get_cloned_repo's docstring). Holding a
+            # lease for the window keeps every read pinned to one internally
+            # consistent checkout pair.
+            lease_token = self.cloned_repo_manager.acquire_clone_lease(
+                self.pre_commit, self.post_commit)
+            try:
+                self._compute_modified_lines(lease_token)
 
-            self.prev_fut_info, self.prev_required_imports = self.get_changed_function_info(version="pre_commit")
-            self.post_fut_info, self.post_required_imports = self.get_changed_function_info(version="post_commit")
+                self.has_non_comment_change = self.count_non_comment_change(lease_token) > 0
 
-            self.changed_functions = set(self.prev_fut_info.keys()).union(set(self.post_fut_info.keys()))
-            self.added_functions = set(self.post_fut_info.keys()).difference(set(self.prev_fut_info.keys()))
-            self.removed_functions = set(self.prev_fut_info.keys()).difference(set(self.post_fut_info.keys()))
-            self.required_imports = self.prev_required_imports
-            for module, imports in self.post_required_imports.items():
-                if module not in self.required_imports:
-                    self.required_imports[module] = set()
-                self.required_imports[module].update(imports)
+                self.prev_fut_info, self.prev_required_imports = self.get_changed_function_info(
+                    version="pre_commit", lease_token=lease_token)
+                self.post_fut_info, self.post_required_imports = self.get_changed_function_info(
+                    version="post_commit", lease_token=lease_token)
 
-            self.import_string = convert_import_dict_to_string(self.required_imports)
-            self.changed_file_contents = self.get_changed_file_contents()
+                self.changed_functions = set(self.prev_fut_info.keys()).union(set(self.post_fut_info.keys()))
+                self.added_functions = set(self.post_fut_info.keys()).difference(set(self.prev_fut_info.keys()))
+                self.removed_functions = set(self.prev_fut_info.keys()).difference(set(self.post_fut_info.keys()))
+                self.required_imports = self.prev_required_imports
+                for module, imports in self.post_required_imports.items():
+                    if module not in self.required_imports:
+                        self.required_imports[module] = set()
+                    self.required_imports[module].update(imports)
+
+                self.import_string = convert_import_dict_to_string(self.required_imports)
+                self.changed_file_contents = self.get_changed_file_contents(lease_token)
+            finally:
+                self.cloned_repo_manager.release_clone_lease(lease_token)
 
             # Save to cache
             with open(cache_file, "wb") as f:
@@ -141,12 +158,12 @@ class PullRequest:
         elif Config.PL == "all":
             return self.non_test_modified_code_files
 
-    def count_non_comment_change(self):
+    def count_non_comment_change(self, lease_token=None):
         if Config.PL == "all":
             return len(self.non_test_modified_code_files) > 0
 
         cloned_repo = self.cloned_repo_manager.get_cloned_repo(
-            self.pre_commit, self.post_commit)
+            self.pre_commit, self.post_commit, lease_token=lease_token)
 
         self.files_with_non_comment_changes = []
         for modified_file in self.non_test_modified_python_files:
@@ -161,8 +178,9 @@ class PullRequest:
             self.files_with_non_comment_changes))  # turn into set while preserving order
         return len(self.files_with_non_comment_changes) > 0
 
-    def get_changed_file_contents(self):
-        cloned_repo = self.cloned_repo_manager.get_cloned_repo(self.pre_commit, self.post_commit)
+    def get_changed_file_contents(self, lease_token=None):
+        cloned_repo = self.cloned_repo_manager.get_cloned_repo(
+            self.pre_commit, self.post_commit, lease_token=lease_token)
         file_contents = {}
         for modified_file in self.non_test_modified_python_files:
             module_name = modified_file.replace("/", ".")
@@ -204,14 +222,15 @@ class PullRequest:
 
         return post_commit_cloned_repo.post_repo.git.diff(self.pre_commit, self.post_commit)
 
-    def get_changed_function_info(self, version):
+    def get_changed_function_info(self, version, lease_token=None):
         result = {}
         required_imports = {}
 
         assert version in ["pre_commit", "post_commit"], \
             f"Unexpected version: {version}. Expected 'pre_commit' or 'post_commit'."
 
-        cloned_repo = self.cloned_repo_manager.get_cloned_repo(self.pre_commit, self.post_commit)
+        cloned_repo = self.cloned_repo_manager.get_cloned_repo(
+            self.pre_commit, self.post_commit, lease_token=lease_token)
         version_repo = cloned_repo.pre_repo if version == "pre_commit" else cloned_repo.post_repo
 
         for modified_file in self.patch.modified_files:
@@ -299,12 +318,12 @@ class PullRequest:
                 )
         return result, required_imports
 
-    def _compute_modified_lines(self):
+    def _compute_modified_lines(self, lease_token=None):
         self.old_file_path_to_modified_lines = {}
         self.new_file_path_to_modified_lines = {}
 
         post_commit_cloned_repo = self.cloned_repo_manager.get_cloned_repo(
-            self.pre_commit, self.post_commit)
+            self.pre_commit, self.post_commit, lease_token=lease_token)
         diff = post_commit_cloned_repo.post_repo.git.diff(
             self.pre_commit, self.post_commit)
         patch = PatchSet(diff)

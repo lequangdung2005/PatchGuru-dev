@@ -214,3 +214,5 @@ logs/*
 .api_token
 .claude/
 .cache_old/
+scripts.txt
+data/*

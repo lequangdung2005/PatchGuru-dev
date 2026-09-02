@@ -60,6 +60,10 @@ def _query_openai(prompt, model, temperature, max_tokens=65536):
 
     try:
         response = client.chat.completions.create(**request_kwargs)
+        # Bind usage before any branch that references it: the empty-choices
+        # path below records tokens and used to reference `usage` before
+        # assignment (UnboundLocalError), crashing the whole per-PR subprocess.
+        usage = response.usage
         # An empty choices list means the API returned no completion
         # (transient error / safety refusal at the request level).
         if not response.choices:
@@ -77,7 +81,6 @@ def _query_openai(prompt, model, temperature, max_tokens=65536):
         choice = response.choices[0]
         response_msg = choice.message.content
         finish_reason = getattr(choice, "finish_reason", None)
-        usage = response.usage
 
         # Extract reasoning + cached tokens from newer OpenAI models (gpt-5, o-series)
         reasoning_tokens = 0

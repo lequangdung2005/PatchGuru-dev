@@ -8,7 +8,7 @@ LOG_LEVEL = "DEBUG"
 # + results.json). Kept only for backward compatibility with old scripts.
 LOG_DIR = os.environ.get("PATCHGURU_LOG_DIR", "logs/batch_runs")
 
-LLM_MODEL = "openai/gpt-oss-120b"  # Default model for LLM queries
+LLM_MODEL = "openai/gpt-5.6-luna"  # Default model for LLM queries
 
 # ── LLM provider base URLs ──────────────────────────────────────────────────
 # The OpenAI client uses these to determine the API endpoint.
@@ -71,8 +71,18 @@ PR_CUT_OFF = {
 #     execution/DockerExecutor.py's `self.container.name.startswith(...)` branches.
 #   - module_name / package_name: the importable package name (identical for every
 #     project below).
-#   - conda_env (scipy only): the mamba/conda env DockerExecutor.py activates
-#     (`mamba activate scipy-dev`) before running scipy code in-container.
+#   - conda_env: the mamba/conda env DockerExecutor.py activates (`mamba
+#     activate <env>`) before running code in-container. Set for scipy
+#     (`scipy-dev`) and pandas (`pandas-dev`, strict-pinned from
+#     environment.yml via .devcontainer/setup_pandas_to_run_in_container.sh).
+#   - rename_script (rename projects with rebuild_per_pr): the container-root
+#     rename/rebuild script DockerExecutor.rebuild_wheels_if_stale() re-runs
+#     after each PR checkout so the installed pre_<pkg>/post_<pkg> wheels match
+#     the analyzed commits (set for all RENAME_PROJECTS: pandas, scipy, keras).
+#   - rebuild_per_pr (all RENAME_PROJECTS): whether to rebuild the renamed
+#     wheels in the container after checking out a PR's pre/post commits (see
+#     rename_script). Leases (ClonedRepoManager.acquire_clone_lease) make this
+#     race-safe across the parallel batch.
 #   - test_extras: the pip extras group installed for test dependencies, mirroring
 #     the `pip install -e '.[...]'` invocations in DockerExecutor.py / the
 #     corresponding setup_<project>.sh.
@@ -82,6 +92,13 @@ PROJECT_CONFIGS: dict = {
         "container_base": "pandas-dev",
         "module_name": "pandas",
         "package_name": "pandas",
+        # Strict/pinned pandas-dev conda env built from pandas's environment.yml
+        # (see .devcontainer/setup_pandas_to_run_in_container.sh). Routes docker
+        # exec through `mamba activate pandas-dev`, incl. the per-PR wheel
+        # rebuild (rebuild_per_pr below).
+        "conda_env": "pandas-dev",
+        "rename_script": "rename_pandas_in_container.sh",
+        "rebuild_per_pr": True,
     },
     "scipy": {
         "repo_id": "scipy/scipy",
@@ -91,12 +108,16 @@ PROJECT_CONFIGS: dict = {
         # Routes docker exec through `mamba activate scipy-dev`
         # (see execution/DockerExecutor.py's scipy branch).
         "conda_env": "scipy-dev",
+        "rename_script": "rename_scipy_in_container.sh",
+        "rebuild_per_pr": True,
     },
     "keras": {
         "repo_id": "keras-team/keras",
         "container_base": "keras",
         "module_name": "keras",
         "package_name": "keras",
+        "rename_script": "rename_keras_in_container.sh",
+        "rebuild_per_pr": True,
     },
     "marshmallow": {
         "repo_id": "marshmallow-code/marshmallow",
