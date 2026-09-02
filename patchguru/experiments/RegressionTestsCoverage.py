@@ -239,11 +239,11 @@ def test_pr(repo_name: str, pr_id: int, mutation_dir: str, github_repo, cloned_r
     pr = PullRequest(github_pr, github_repo, cloned_repo_manager)
     function_id = list(pr.post_fut_info.keys())[0]
     function_name = function_id.split('.')[-1]
-    cloned_repo = cloned_repo_manager.get_cloned_repo(pr.post_commit)
-    print(cloned_repo.repo.working_dir)
+    cloned_repo = cloned_repo_manager.get_cloned_repo(pr.pre_commit, pr.post_commit)
+    print(cloned_repo.post_repo.working_dir)
     # Check if "dev.py" exists in the repo for scipy
     if repo_name == "scipy":
-        dev_py_path = os.path.join(cloned_repo.repo.working_dir, "dev.py")
+        dev_py_path = os.path.join(cloned_repo.post_repo.working_dir, "dev.py")
         if not os.path.exists(dev_py_path):
             # Force to use spin test
             TEST_CMD = "spin test -v -- -o log_cli=true --log-cli-level=INFO -s --continue-on-collection-errors"
@@ -258,7 +258,7 @@ def test_pr(repo_name: str, pr_id: int, mutation_dir: str, github_repo, cloned_r
     end_line = pr.post_fut_info[function_id]["end_line"]
 
     file_path = list(pr.post_fut_info.values())[0]["file_path"]
-    abs_file_path = os.path.join(cloned_repo.repo.working_dir, file_path)
+    abs_file_path = os.path.join(cloned_repo.post_repo.working_dir, file_path)
 
     # Filter tests
     relevant_test_cases = set()

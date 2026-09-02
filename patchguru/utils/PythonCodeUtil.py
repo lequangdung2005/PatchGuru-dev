@@ -611,6 +611,28 @@ def convert_import_dict_to_string(imported_modules):
             result.append(import_str)
     return "\n".join(result)
 
+
+def filter_own_package_imports(imported_modules, base_package):
+    """Drop imports that belong to *base_package*'s own namespace tree.
+
+    Under dual-version execution the target package is loaded into isolated
+    ``pre_<pkg>`` / ``post_<pkg>`` namespaces (see LoaderHeader). Any bare
+    ``import <base_package>`` / ``from <base_package>.<sub> import X`` in the
+    generated driver would resolve through the interpreter's ``sys.path`` to the
+    single container-installed copy of the package -- a third, uncontrolled
+    version -- instead of the checked-out pre/post versions. Such package-own
+    symbols must be reached through the ``pre_<pkg>`` / ``post_<pkg>``
+    namespaces instead, so they are filtered out of the harvestable-import set;
+    genuine third-party dependencies (e.g. ``import numpy``) are untouched.
+    """
+    if not base_package:
+        return imported_modules
+    return {
+        module: names
+        for module, names in imported_modules.items()
+        if not (module == base_package or module.startswith(base_package + "."))
+    }
+
 def extract_target_function_by_range(code, patch_range):
     try:
         tree = cst.parse_module(code)

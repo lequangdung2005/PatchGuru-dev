@@ -1,76 +1,88 @@
-import argparse
 import os
 import json
-import numpy as np
-from datetime import datetime, timezone
+
+from patchguru.utils.ResultsLayout import iter_function_dirs
 
 
-def parse_logs(log_dir):
-    log_files = os.listdir(log_dir)
-    usage_results = {}
-    for log_file in log_files:
-        event_path = os.path.join(log_dir, log_file, "events.jsonl")
-        usage_path = os.path.join(log_dir, log_file, "llm_usage.json")
+def first_review_conclusion(results) -> str | None:
+    """Return the conclusion of the first assertion review, or None if no
+    review ran. Reads the first entry of results["review_traces"].
 
-        # Load events
-        events = []
-        assert os.path.exists(event_path), f"Event file not found: {event_path}"
-        with open(event_path, "r") as f:
-            for line in f:
-                events.append(json.loads(line))
-
-        # Load LLM usage
-        llm_usage = []
-        assert os.path.exists(usage_path), f"LLM usage file not found: {usage_path}"
-        with open(usage_path, "r") as f:
-            data = json.load(f)
-            for entry in data:
-                if "completion_tokens" in entry:
-                    llm_usage.append(entry)
+    Falls back to the top-level ``review_conclusion`` for pre-refactor
+    cached results that predate ``review_traces``; a ``NORMAL`` conclusion
+    (no assertion review ran) yields ``None`` so it is not counted as a
+    warning.
+    """
+    traces = results.get("review_traces")
+    if isinstance(traces, list) and traces:
+        return traces[0].get("conclusion")
+    conclusion = results.get("review_conclusion")
+    if conclusion in ("BUG", "MISMATCH"):
+        return conclusion
+    return None
 
 
-        pr_nb = events[0]["pr_nb"]
-        assert pr_nb not in usage_results, f"Duplicate PR number found: {pr_nb}, {os.path.join(log_dir, log_file)}, {usage_results[pr_nb]['log_dir']}"
-        usage_results[str(pr_nb)] = {
-            "events": events,
-            "llm_usage": llm_usage,
-            "log_dir": os.path.join(log_dir, log_file)
-        }
-    return usage_results
+def _pr_review_conclusion(pr_dir) -> str | None:
+    """Aggregate a PR's per-function review conclusions into one PR-level
+    conclusion (a PR now runs one independent oracle per modified function,
+    see utils/ResultsLayout.py). Mirrors the BUG-if-any policy used by
+    effectiveness.py/efficiency.py's ``summarize_pr_outcome``: the PR counts
+    as a BUG warning if any function's review concluded BUG, else a MISMATCH
+    warning if any function's review concluded MISMATCH, else no warning.
+    """
+    saw_mismatch = False
+    for _fct_name, fct_dir in iter_function_dirs(pr_dir):
+        # Phase 1 review happens first, so it determines the conclusion when
+        # present; otherwise fall back to the Phase 2 review.
+        conclusion = None
+        results_path = os.path.join(fct_dir, "results.json")
+        if os.path.exists(results_path):
+            with open(results_path, "r") as f:
+                conclusion = first_review_conclusion(json.load(f))
+
+        if conclusion is None:
+            phase2_path = os.path.join(fct_dir, "phase2", "results.json")
+            if os.path.exists(phase2_path):
+                with open(phase2_path, "r") as f:
+                    conclusion = first_review_conclusion(json.load(f))
+
+        if conclusion == "BUG":
+            return "BUG"
+        if conclusion == "MISMATCH":
+            saw_mismatch = True
+
+    return "MISMATCH" if saw_mismatch else None
+
 
 def analyze(project):
     result_dir = f".cache/oracles/{project}"
     data_id_path = f".cache/pr_ids/{project}.txt"
-    log_dir = f"logs/{project}"
     with open(data_id_path, "r") as f:
         data_ids = [line.strip() for line in f]
 
     n_warnings = 0
     n_bug = 0
     n_mismatch = 0
-    log_results = parse_logs(log_dir)
-    for data_id in data_ids:
-        assert data_id in log_results, f"Data ID {data_id} not found in logs for project {project}"
-        for event in log_results[data_id]["events"]:
-            if "type" in event and event["type"] == "SpecReviewResult":
-                n_warnings += 1
-                if "Test driver review completed. Conclusion: BUG" in event["message"]:
-                    n_bug += 1
-                elif "Test driver review completed. Conclusion: MISMATCH" in event["message"]:
-                    n_mismatch += 1
-                else:
-                    assert False, f"Unexpected conclusion in SpecReviewResult for Data ID {data_id}: {event['message']}"
-                break
-            
-    
-                
-            
 
-            
-                
+    for data_id in data_ids:
+        pr_dir = os.path.join(result_dir, data_id)
+        conclusion = _pr_review_conclusion(pr_dir)
+
+        if conclusion is None:
+            continue  # No assertion review ran for this PR
+
+        n_warnings += 1
+        if conclusion == "BUG":
+            n_bug += 1
+        elif conclusion == "MISMATCH":
+            n_mismatch += 1
+        else:
+            raise ValueError(
+                f"Unexpected review conclusion for Data ID {data_id}: {conclusion}"
+            )
+
     return n_warnings, n_bug, n_mismatch
 
-    
 
 if __name__ == "__main__":
     _MAPPING = {
@@ -79,7 +91,7 @@ if __name__ == "__main__":
         "keras": "Keras",
         "marshmallow": "Marshmallow"
     }
-    
+
     n_warnings = 0
     n_bugs = 0
     n_mismatches = 0
@@ -113,10 +125,7 @@ if __name__ == "__main__":
                     n_fp_in_mismatch += 1
                 else:
                     assert False, f"Invalid label in mismatch_cases.txt for project {project}: {line}"
-            
 
-    
-    
     print(f"Total number of warnings across all projects: {n_warnings}")
     print(f"Total number of bugs identified across all projects: {n_bugs}")
     print(f"Total number of mismatches identified across all projects: {n_mismatches}")

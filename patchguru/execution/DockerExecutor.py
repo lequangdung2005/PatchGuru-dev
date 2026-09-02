@@ -6,9 +6,17 @@ from os import chdir, getcwd
 from typing import Optional, Tuple
 import argparse
 import time
+from patchguru import Config
 from patchguru.utils.PullRequest import PullRequest
 from patchguru.analysis.PRRetriever import get_repo
-from patchguru.utils.Tracker import append_event, Event
+
+
+def _resolve_project(container_name: str) -> Optional[str]:
+    for project, project_config in Config.PROJECT_CONFIGS.items():
+        if container_name.startswith(project_config["container_base"]):
+            return project
+    return None
+
 
 class DockerExecutor:
     def __init__(self, container_name):
@@ -36,15 +44,7 @@ class DockerExecutor:
             data = open(tar_file, "rb").read()
             self.container.put_archive(target_dir, data)
 
-    def filter_logs(self, logs: str, container_name: str) -> str:
-        import re
-
     def execute_python_code(self, code: str, python_executable: str = "python3", timeout: Optional[int] = 900) -> Tuple[bool, str, str]:
-        append_event(Event(
-            level="INFO",
-            message=f"Executing code in container {self.container.name} with timeout {timeout} seconds.",
-            type="ExecutionStart"
-        ))
         exec_result = self.container.exec_run("rm -rf /tmp/PatchGuru")
 
         exec_result = self.container.exec_run("mkdir /tmp/PatchGuru")
@@ -53,53 +53,29 @@ class DockerExecutor:
             f"timeout {timeout}s {python_executable} /tmp/PatchGuru/PatchGuru_test_code.py"
         )
 
-        if self.container.name.startswith("scipy-dev"):
+        # Rename-projects (Config.RENAME_PROJECTS) get their pre_<pkg>/post_<pkg>
+        # distributions installed once, at container-build time, by the
+        # .devcontainer/setup_<project>.sh + rename_<project>_in_container.sh flow
+        # (see docs/analysis-architecture.md's "Dual-version execution model").
+        # Non-rename projects need no install step either: load_package()
+        # (execution/OracleHelpers.py) reads /pre_version and /post_version
+        # source directly at runtime. So the only per-execution step left is
+        # activating a project's conda env, when it has one (scipy).
+        project = _resolve_project(self.container.name)
+        conda_env = Config.PROJECT_CONFIGS.get(project, {}).get("conda_env") if project else None
+        if conda_env:
             command = (
                 f"bash -c 'source /root/conda/etc/profile.d/conda.sh"
-                f" && eval \"$(mamba shell hook --shell bash)\" && mamba activate scipy-dev"
-                f" && {command}'"
-            )
-
-        elif self.container.name.startswith("keras"):
-            command = (
-                f"bash -c 'cd /home/keras/"
-                f" && pip install -e ."
-                f" && {command}'"
-            )
-
-        elif self.container.name.startswith("marshmallow"):
-            command = (
-                f"bash -c 'cd /home/marshmallow/"
-                f" && pip install -e '.[dev]'"
+                f" && eval \"$(mamba shell hook --shell bash)\" && mamba activate {conda_env}"
                 f" && {command}'"
             )
 
         exec_result = self.container.exec_run(command)
         output = exec_result.output.decode("utf-8")
         exit_code = exec_result.exit_code
-        append_event(Event(
-            level="INFO",
-            message=[
-                f"Execution completed in container {self.container.name} with exit code {exit_code}.",
-                "---------------------- Execution Output -----------------",
-                output
-            ],
-            type="ExecutionEnd",
-            info={
-                "exit_code": exit_code,
-                "output": output
-            }
-        ))
         return exit_code, output
 
     def execute_shell_command(self, command: str, timeout: int = 3600) -> Tuple[bool, str, str]:
-        append_event(Event(
-            level="INFO",
-            message=f"Executing shell command in container {self.container.name}.",
-            type="ShellCommandStart"
-        ))
-
-
         if self.container.name.startswith("scipy-dev"):
             if type(command) == list:
                 command = [
@@ -116,23 +92,9 @@ class DockerExecutor:
                     f" && eval \"$(mamba shell hook --shell bash)\" && mamba activate scipy-dev"
                     f" && cd /home/scipy && {command}'"
                 )
-        print(command)
         exec_result = self.container.exec_run(command)
         output = exec_result.output.decode("utf-8")
         exit_code = exec_result.exit_code
-        append_event(Event(
-            level="INFO",
-            message=[
-                f"Shell command execution completed in container {self.container.name} with exit code {exit_code}.",
-                "---------------------- Command Output -----------------",
-                output
-            ],
-            type="ShellCommandEnd",
-            info={
-                "exit_code": exit_code,
-                "output": output
-            }
-        ))
         return exit_code, output
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Execute Python code in a Docker container for a given PR.")
@@ -146,7 +108,7 @@ if __name__ == "__main__":
     github_pr = github_repo.get_pull(args.pr)
     pr = PullRequest(github_pr, github_repo, cloned_repo_manager)
     commit = pr.post_commit
-    cloned_repo = cloned_repo_manager.get_cloned_repo(commit)
+    cloned_repo = cloned_repo_manager.get_cloned_repo(pr.pre_commit, pr.post_commit)
     container_name = cloned_repo.container_name
     docker_executor = DockerExecutor(container_name)
     file_path = args.file_path

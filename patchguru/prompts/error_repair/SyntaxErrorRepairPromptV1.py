@@ -1,4 +1,5 @@
-from patchguru.utils.Tracker import Event, append_event
+from patchguru.utils.LoaderHeader import strip_loader_header
+
 
 class SyntaxErrorRepairPrompt:
     def __init__(self):
@@ -21,6 +22,8 @@ You are an expert Python software engineer. Your task is to correct syntax error
     * **Missing or Mismatched Brackets/Parentheses:** Ensure every opening of bracket, parenthesis, or brace has a corresponding closing one.
     * **Incorrect Indentation:** Python uses indentation to define code blocks. Mixing spaces and tabs or having an inconsistent number of spaces will cause an `IndentationError`.
     * **Missing Dependencies:** Ensure all necessary imports are present and correctly spelled.
+
+4.  **Preserve Dual-Namespace Calls:** The target function(s) are accessed through two pre-loaded module namespaces, `pre_<pkg>` and `post_<pkg>`, using their real, unmodified names (e.g., `pre_<pkg>.calculate_sum(...)` / `post_<pkg>.calculate_sum(...)`). Keep every such call exactly as it appears -- do not rename the function, strip the `pre_<pkg>`/`post_<pkg>` prefix, or merge the two versions into a single bare call.
 
 # Input
 
@@ -62,21 +65,12 @@ You will be provided a test driver that is used to validate the expected relatio
 
     def parse_answer(self, answer):
         results = {}
-        if "<reasoning>" not in answer or "</reasoning>" not in answer:
-            append_event(Event(
-                level="WARNING",
-                message="Missing required tag: <reasoning>"
-            ))
-        else:
+        if "<reasoning>" in answer and "</reasoning>" in answer:
             reasoning_start = answer.index("<reasoning>") + len("<reasoning>")
             reasoning_end = answer.index("</reasoning>")
             results["reasoning"] = answer[reasoning_start:reasoning_end].strip()
 
         if "<fixed_code>" not in answer or "</fixed_code>" not in answer:
-            append_event(Event(
-                level="ERROR",
-                message="Missing required tag: <fixed_code>"
-            ))
             return None
 
         try:
@@ -92,37 +86,24 @@ You will be provided a test driver that is used to validate the expected relatio
 
             results["fixed_code"] = fixed_code
         except ValueError as e:
-            append_event(Event(
-                level="ERROR",
-                message=f"Error while parsing answer: {str(e)}"
-            ))
             return None
         return results
 
-    def insert_code(self, prev_fut_code: str, post_fut_code: str, specification: str) -> str:
+    def insert_code(self, prev_fut_code: str, post_fut_code: str, specification: str, loader_header: str = "") -> str:
             """
             Inserts concrete function code into the specification.
             """
+            specification = strip_loader_header(specification)
             if "# Source Code of target function(s)" not in specification or "# Specification" not in specification:
-                append_event(Event(
-                    level="ERROR",
-                    message="Specification format is incorrect. Missing required sections."
-                ))
                 return None
 
             import_part = specification.split("# Source Code of target function(s)")[0].strip()
             spec_part = specification.split("# Specification")[1].strip()
 
             completed_specification = f"""
-{import_part}
+{loader_header}{import_part}
 
 # Source Code of target function(s)
-
-## Before Pull Request
-{prev_fut_code}
-
-## After Pull Request
-{post_fut_code}
 
 # Specification
 {spec_part}

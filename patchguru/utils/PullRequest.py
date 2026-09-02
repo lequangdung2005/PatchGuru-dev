@@ -8,13 +8,13 @@ from patchguru.utils.PythonCodeUtil import (
     get_locations_of_calls_by_range,
     extract_imported_modules,
     convert_import_dict_to_string,
+    filter_own_package_imports,
     get_top_level_function_and_class,
     get_class_name
 )
 from patchguru import Config
 import os
 import pickle
-from patchguru.utils.Tracker import append_event, Event
 
 class PullRequest:
     def __init__(self, github_pr, github_repo, cloned_repo_manager):
@@ -34,10 +34,6 @@ class PullRequest:
 
         # Try to load from cache
         if os.path.exists(cache_file):
-            append_event(Event(
-                level="DEBUG", pr_nb=self.number,
-                message=f"Cache hit for PR #{self.number}, loading from cache"
-            ))
             with open(cache_file, "rb") as f:
                 cached = pickle.load(f)
             try:
@@ -58,11 +54,8 @@ class PullRequest:
                 self.import_string = cached["import_string"]
                 self.changed_file_contents = cached["changed_file_contents"]
                 return
-            except KeyError as e:
-                append_event(Event(
-                    level="WARNING", pr_nb=self.number,
-                    message=f"Failed to load cache for PR #{self.number}: {e}. Re-initializing from scratch."
-                ))
+            except KeyError:
+                pass
         try:
 
             self._pr_url_to_patch()
@@ -107,15 +100,7 @@ class PullRequest:
                     "changed_file_contents": self.changed_file_contents,
                 }
                 pickle.dump(cached_data, f)
-                append_event(Event(
-                    level="DEBUG", pr_nb=self.number,
-                    message=f"Saved PR #{self.number} data to cache: {cache_file}"
-                ))
         except Exception as e:
-            append_event(Event(
-                level="ERROR", pr_nb=self.number,
-                message=f"Failed to get changed function info for PR #{self.number}: {e}"
-            ))
             with open(cache_file, "wb") as f:
                 cached_data = {
                     "error": str(e)
@@ -160,16 +145,14 @@ class PullRequest:
         if Config.PL == "all":
             return len(self.non_test_modified_code_files) > 0
 
-        pre_commit_cloned_repo = self.cloned_repo_manager.get_cloned_repo(
-            self.pre_commit)
-        post_commit_cloned_repo = self.cloned_repo_manager.get_cloned_repo(
-            self.post_commit)
+        cloned_repo = self.cloned_repo_manager.get_cloned_repo(
+            self.pre_commit, self.post_commit)
 
         self.files_with_non_comment_changes = []
         for modified_file in self.non_test_modified_python_files:
-            with open(f"{pre_commit_cloned_repo.repo.working_dir}/{modified_file}", "r") as f:
+            with open(f"{cloned_repo.pre_repo.working_dir}/{modified_file}", "r") as f:
                 old_file_content = f.read()
-            with open(f"{post_commit_cloned_repo.repo.working_dir}/{modified_file}", "r") as f:
+            with open(f"{cloned_repo.post_repo.working_dir}/{modified_file}", "r") as f:
                 new_file_content = f.read()
             if not equal_modulo_docstrings(old_file_content, new_file_content):
                 self.files_with_non_comment_changes.append(modified_file)
@@ -179,7 +162,7 @@ class PullRequest:
         return len(self.files_with_non_comment_changes) > 0
 
     def get_changed_file_contents(self):
-        cloned_repo = self.cloned_repo_manager.get_cloned_repo(self.pre_commit)
+        cloned_repo = self.cloned_repo_manager.get_cloned_repo(self.pre_commit, self.post_commit)
         file_contents = {}
         for modified_file in self.non_test_modified_python_files:
             module_name = modified_file.replace("/", ".")
@@ -205,11 +188,11 @@ class PullRequest:
 
     def get_filtered_diff(self):
         post_commit_cloned_repo = self.cloned_repo_manager.get_cloned_repo(
-            self.post_commit)
+            self.pre_commit, self.post_commit)
 
         diff_parts = []
         for file_path in self._get_relevant_changed_files():
-            raw_diff = post_commit_cloned_repo.repo.git.diff(
+            raw_diff = post_commit_cloned_repo.post_repo.git.diff(
                 self.pre_commit, self.post_commit, file_path)
             diff_parts.append(raw_diff)
 
@@ -217,9 +200,9 @@ class PullRequest:
 
     def get_full_diff(self):
         post_commit_cloned_repo = self.cloned_repo_manager.get_cloned_repo(
-            self.post_commit)
+            self.pre_commit, self.post_commit)
 
-        return post_commit_cloned_repo.repo.git.diff(self.pre_commit, self.post_commit)
+        return post_commit_cloned_repo.post_repo.git.diff(self.pre_commit, self.post_commit)
 
     def get_changed_function_info(self, version):
         result = {}
@@ -228,14 +211,12 @@ class PullRequest:
         assert version in ["pre_commit", "post_commit"], \
             f"Unexpected version: {version}. Expected 'pre_commit' or 'post_commit'."
 
-        if version == "pre_commit":
-            cloned_repo = self.cloned_repo_manager.get_cloned_repo(self.pre_commit)
-        else:
-            cloned_repo = self.cloned_repo_manager.get_cloned_repo(self.post_commit)
+        cloned_repo = self.cloned_repo_manager.get_cloned_repo(self.pre_commit, self.post_commit)
+        version_repo = cloned_repo.pre_repo if version == "pre_commit" else cloned_repo.post_repo
 
         for modified_file in self.patch.modified_files:
             if modified_file.path in self._get_relevant_changed_files():
-                with open(f"{cloned_repo.repo.working_dir}/{modified_file.path}", "r") as f:
+                with open(f"{version_repo.working_dir}/{modified_file.path}", "r") as f:
                     new_file_content = f.read()
 
                 top_level_function_and_class = get_top_level_function_and_class(new_file_content)
@@ -305,6 +286,17 @@ class PullRequest:
                 for name in all_function_and_class_names:
                     if name not in changed_function_names:
                         required_imports[module_name].add((name, None))
+
+                # Drop package-own imports. Everything under this repo's own
+                # package is loaded into the pre_<pkg>/post_<pkg> namespaces by
+                # the dual-execution loader; harvesting it as a bare
+                # `from <pkg>.<sub> import X` would resolve to the single
+                # installed container version instead of the checked-out pre/post
+                # ones. Only true third-party deps may stay as bare imports.
+                base_package = module_name.split(".")[0]
+                required_imports = filter_own_package_imports(
+                    required_imports, base_package
+                )
         return result, required_imports
 
     def _compute_modified_lines(self):
@@ -312,8 +304,8 @@ class PullRequest:
         self.new_file_path_to_modified_lines = {}
 
         post_commit_cloned_repo = self.cloned_repo_manager.get_cloned_repo(
-            self.post_commit)
-        diff = post_commit_cloned_repo.repo.git.diff(
+            self.pre_commit, self.post_commit)
+        diff = post_commit_cloned_repo.post_repo.git.diff(
             self.pre_commit, self.post_commit)
         patch = PatchSet(diff)
 
@@ -334,21 +326,25 @@ class PullRequest:
         Returns a list of docstrings that are relevant to the changed functions.
         """
         if version == "post_commit":
-            cloned_repo = self.cloned_repo_manager.get_cloned_repo(self.post_commit)
             fut_info = self.post_fut_info
         elif version == "pre_commit":
-            cloned_repo = self.cloned_repo_manager.get_cloned_repo(self.pre_commit)
             fut_info = self.prev_fut_info
         else:
             raise ValueError(f"Unexpected version: {version}. Expected 'pre_commit' or 'post_commit'.")
+
+        cloned_repo = self.cloned_repo_manager.get_cloned_repo(self.pre_commit, self.post_commit)
+        version_repo = cloned_repo.post_repo if version == "post_commit" else cloned_repo.pre_repo
+        version_language_server = (
+            cloned_repo.post_language_server if version == "post_commit" else cloned_repo.pre_language_server
+        )
 
         result = ""
         for fut_name, fut_data in fut_info.items():
             file_path = fut_data["file_path"]
             start_line = fut_data["start_line"]
             end_line = fut_data["end_line"]
-            f"{cloned_repo.repo.working_dir}/{file_path}"
-            with open(f"{cloned_repo.repo.working_dir}/{file_path}", "r") as f:
+            f"{version_repo.working_dir}/{file_path}"
+            with open(f"{version_repo.working_dir}/{file_path}", "r") as f:
                 file_content = f.read()
 
             call_locations = get_locations_of_calls_by_range(
@@ -356,7 +352,7 @@ class PullRequest:
             )
 
 
-            server = cloned_repo.language_server
+            server = version_language_server
             docs = []
             for call_location in call_locations:
                 line = call_location.start.line - 1  # LSP lines are 0-based

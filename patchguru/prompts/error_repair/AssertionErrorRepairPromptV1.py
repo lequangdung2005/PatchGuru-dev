@@ -1,4 +1,5 @@
-from patchguru.utils.Tracker import Event, append_event
+from patchguru.utils.LoaderHeader import strip_loader_header
+
 
 class AssertionErrorRepairPrompt:
     def __init__(self):
@@ -18,6 +19,8 @@ To successfully fix the test driver and resolve the **AssertionError** in the pr
 2.  **Identify the Incorrect Specification:** The `AssertionError` tells you exactly where the test driver's expectation is not being met. Pinpoint the specific assertion that's failing. The message provided with the error (if any) will likely point to the line number and a description of what failed, which is your most valuable clue. The "specification" you need to correct is the expected output, input, or relationship defined in the assertion itself.
 
 3.  **Adjust the Test Driver, Not the Function:** Your role is to fix the *specifications* in the test driver. **Do not modify the pre-PR function code.** The goal is to make the test accurately reflect the function's correct behavior *before* the pull request. Changing the function would defeat the purpose of validating the PR's changes. The fix lies in adjusting the `assert` statement's parameters to match the function's actual, correct output.
+
+4.  **Preserve Dual-Namespace Calls:** The target function(s) are accessed through two pre-loaded module namespaces, `pre_<pkg>` and `post_<pkg>`, using their real, unmodified names (e.g., `pre_<pkg>.calculate_sum(...)` / `post_<pkg>.calculate_sum(...)`). Keep every such call exactly as it appears -- do not rename the function, strip the `pre_<pkg>`/`post_<pkg>` prefix, or merge the two versions into a single bare call.
 
 # Input
 
@@ -60,21 +63,12 @@ You will be provided a test driver that is used to validate the expected relatio
 
     def parse_answer(self, answer):
         results = {}
-        if "<reasoning>" not in answer or "</reasoning>" not in answer:
-            append_event(Event(
-                level="WARNING",
-                message="Missing required tag: <reasoning>"
-            ))
-        else:
+        if "<reasoning>" in answer and "</reasoning>" in answer:
             reasoning_start = answer.index("<reasoning>") + len("<reasoning>")
             reasoning_end = answer.index("</reasoning>")
             results["reasoning"] = answer[reasoning_start:reasoning_end].strip()
 
         if "<fixed_code>" not in answer or "</fixed_code>" not in answer:
-            append_event(Event(
-                level="ERROR",
-                message="Missing required tag: <fixed_code>"
-            ))
             return None
 
         try:
@@ -90,37 +84,24 @@ You will be provided a test driver that is used to validate the expected relatio
 
             results["fixed_code"] = fixed_code
         except ValueError as e:
-            append_event(Event(
-                level="ERROR",
-                message=f"Error while parsing answer: {str(e)}"
-            ))
             return None
         return results
 
-    def insert_code(self, prev_fut_code: str, post_fut_code: str, specification: str) -> str:
+    def insert_code(self, prev_fut_code: str, post_fut_code: str, specification: str, loader_header: str = "") -> str:
             """
             Inserts concrete function code into the specification.
             """
+            specification = strip_loader_header(specification)
             if "# Source Code of target function(s)" not in specification or "# Specification" not in specification:
-                append_event(Event(
-                    level="ERROR",
-                    message="Specification format is incorrect. Missing required sections."
-                ))
                 return None
 
             import_part = specification.split("# Source Code of target function(s)")[0].strip()
             spec_part = specification.split("# Specification")[1].strip()
 
             completed_specification = f"""
-{import_part}
+{loader_header}{import_part}
 
 # Source Code of target function(s)
-
-## Before Pull Request
-{prev_fut_code}
-
-## After Pull Request
-{post_fut_code}
 
 # Specification
 {spec_part}

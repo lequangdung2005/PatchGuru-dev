@@ -1,5 +1,3 @@
-from patchguru.utils.Tracker import Event, append_event
-
 class ReferenceSummaryPrompt:
     def __init__(self):
         pass
@@ -51,10 +49,6 @@ Your output should be a concise summary in the following format:
     def parse_answer(self, answer: str) -> dict | None:
         results = {}
         if "<summary>" not in answer or "</summary>" not in answer:
-            append_event(Event(
-                level="ERROR",
-                message="LLM response is missing required tag: <summary>"
-            ))
             return None
 
         try:
@@ -65,10 +59,6 @@ Your output should be a concise summary in the following format:
             results["summary"] = summary
 
         except ValueError as e:
-            append_event(Event(
-                level="ERROR",
-                message=f"Error while parsing LLM response: {e}"
-            ))
             return None
 
         return results

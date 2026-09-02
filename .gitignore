@@ -210,5 +210,7 @@ __marimo__/
 .sh
 logs/*
 .cache/*
-.openai_token
 .github_token
+.api_token
+.claude/
+.cache_old/

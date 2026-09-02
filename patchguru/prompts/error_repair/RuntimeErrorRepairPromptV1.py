@@ -1,4 +1,5 @@
-from patchguru.utils.Tracker import Event, append_event
+from patchguru.utils.LoaderHeader import strip_loader_header
+
 
 class RuntimeErrorRepairPrompt:
     def __init__(self):
@@ -21,9 +22,11 @@ You are an expert Python software engineer. Your task is to correct runtime erro
     * **`IndexError` or `KeyError`:** You are trying to access an item in a list or dictionary with an index or key that does not exist.
     * **`ValueError`:** A function receives an argument of the correct type but an inappropriate value (e.g., `int("abc")`).
 
+4.  **Preserve Dual-Namespace Calls:** The target function(s) are accessed through two pre-loaded module namespaces, `pre_<pkg>` and `post_<pkg>`, using their real, unmodified names (e.g., `pre_<pkg>.calculate_sum(...)` / `post_<pkg>.calculate_sum(...)`). Keep every such call exactly as it appears -- do not rename the function, strip the `pre_<pkg>`/`post_<pkg>` prefix, or merge the two versions into a single bare call.
+
 # Input
 
-You will be provided a test driver that is used to validate the expected relationship between two versions of a function: before and after a pull request. The code is expected to run without errors. However, it is currently faced with SYNTAX errors as follows:
+You will be provided a test driver that is used to validate the expected relationship between two versions of a function: before and after a pull request. The code is expected to run without errors. However, it is currently faced with RUNTIME errors as follows:
 
 ## Test Driver
 
@@ -50,7 +53,7 @@ You will be provided a test driver that is used to validate the expected relatio
 </reasoning>
 
 <fixed_code>
-[Put the fixed code here that resolves the syntax error. Ensure that the code is executable and maintains the original semantics of the test driver.]
+[Put the fixed code here that resolves the runtime error. Ensure that the code is executable and maintains the original semantics of the test driver.]
 </fixed_code>
     """
         query = template.format(
@@ -62,21 +65,12 @@ You will be provided a test driver that is used to validate the expected relatio
     def parse_answer(self, answer):
 
         results = {}
-        if "<reasoning>" not in answer or "</reasoning>" not in answer:
-            append_event(Event(
-                level="WARNING",
-                message="Missing required tag: <reasoning>"
-            ))
-        else:
+        if "<reasoning>" in answer and "</reasoning>" in answer:
             reasoning_start = answer.index("<reasoning>") + len("<reasoning>")
             reasoning_end = answer.index("</reasoning>")
             results["reasoning"] = answer[reasoning_start:reasoning_end].strip()
 
         if "<fixed_code>" not in answer or "</fixed_code>" not in answer:
-            append_event(Event(
-                level="ERROR",
-                message="Missing required tag: <fixed_code>"
-            ))
             return None
 
         try:
@@ -92,37 +86,24 @@ You will be provided a test driver that is used to validate the expected relatio
 
             results["fixed_code"] = fixed_code
         except ValueError as e:
-            append_event(Event(
-                level="ERROR",
-                message=f"Error while parsing answer: {str(e)}"
-            ))
             return None
         return results
 
-    def insert_code(self, prev_fut_code: str, post_fut_code: str, specification: str) -> str:
+    def insert_code(self, prev_fut_code: str, post_fut_code: str, specification: str, loader_header: str = "") -> str:
             """
             Inserts concrete function code into the specification.
             """
+            specification = strip_loader_header(specification)
             if "# Source Code of target function(s)" not in specification or "# Specification" not in specification:
-                append_event(Event(
-                    level="ERROR",
-                    message="Specification format is incorrect. Missing required sections."
-                ))
                 return None
 
             import_part = specification.split("# Source Code of target function(s)")[0].strip()
             spec_part = specification.split("# Specification")[1].strip()
 
             completed_specification = f"""
-{import_part}
+{loader_header}{import_part}
 
 # Source Code of target function(s)
-
-## Before Pull Request
-{prev_fut_code}
-
-## After Pull Request
-{post_fut_code}
 
 # Specification
 {spec_part}

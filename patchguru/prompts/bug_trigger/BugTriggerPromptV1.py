@@ -1,4 +1,9 @@
-from patchguru.utils.Tracker import Event, append_event
+from patchguru.utils.LoaderHeader import (
+    build_module_path_guidance,
+    check_valid as _loader_check_valid,
+)
+from patchguru.utils.LoaderHeader import strip_loader_header
+
 
 class BugTriggerPrompt:
     def __init__(self):
@@ -13,6 +18,7 @@ class BugTriggerPrompt:
         post_fut_code: str,
         enclosing_class: str = "",
         available_import: str = "",
+        module_path: str = "",
     ) -> str:
         template = """
 # Role
@@ -88,6 +94,8 @@ You will be provided specification written in Python assertions that describes t
 {post_fut_code}
 ```
 
+{module_path_guidance}
+
 ## Available Imports
 You can also refer to the available imports and assume they are already imported in the test driver:
 ```python
@@ -98,7 +106,7 @@ You can also refer to the available imports and assume they are already imported
 
 1. Please keep existing information in the specification intact. You should only add more test cases to the specification and modify existing assertions to make them more general, but you MUST NOT change their fundamental meaning or intent.
 
-2. Function names of the pre-PR and post-PR versions should be denoted by "pre_" and "post_" prefixes, respectively. For example, if the function name is "calculate_sum", the pre-PR version should be named "pre_calculate_sum" and the post-PR version should be named "post_calculate_sum".
+2. The pre-PR and post-PR versions of the target function(s) are NOT separately renamed or redefined. Instead, both real package versions are pre-loaded as two module-qualified namespaces, `pre_<pkg>` and `post_<pkg>` (where `<pkg>` is the package under test), and you MUST call the function(s) being tested through these namespaces using their real, unmodified name. For example, if the function is "calculate_sum", call the pre-PR version as `pre_<pkg>.calculate_sum(...)` and the post-PR version as `post_<pkg>.calculate_sum(...)`.
 
 3. Test drivers should be carefully documented in the comments to describe how test cases are generated and what behaviors they are testing.
 
@@ -126,13 +134,13 @@ You can also refer to the available imports and assume they are already imported
 
 # Source Code of target function(s)
 ## Before Pull Request
-### [Placeholders for pre-PR function, e.g., def pre_function(): ... This placeholder will be replaced with the actual pre-PR function code later.]
+### [Placeholder for pre-PR function code -- this placeholder will be replaced with the actual pre-PR function code later.]
 
 ## After Pull Request
-### [Placeholders for post-PR function, e.g., def post_function(): ... This placeholder will be replaced with the actual post-PR function code later.]
+### [Placeholder for post-PR function code -- this placeholder will be replaced with the actual post-PR function code later.]
 
 # Specification
-## [Put your generalized specification with added test cases here. Make sure to keep existing information intact and only add more test cases or generalize existing assertions.]
+## [Put your generalized specification with added test cases here, calling the target function(s) through the `pre_<pkg>`/`post_<pkg>` namespaces using their real, unmodified names. Make sure to keep existing information intact and only add more test cases or generalize existing assertions.]
 
 </test_driver>
         """
@@ -156,38 +164,25 @@ Target function (s) are defined in the following class:
             prev_fut_names=prev_fut_names,
             post_fut_code=post_fut_code,
             context=context,
-            available_import=available_import
+            available_import=available_import,
+            module_path_guidance=build_module_path_guidance(module_path),
         )
         return query
 
     def parse_answer(self, answer: str) -> dict | None:
         results = {}
-        if "<reasoning>" not in answer or "</reasoning>" not in answer:
-            append_event(Event(
-                level="WARNING",
-                message="Missing required tag: <reasoning>"
-            ))
-        else:
+        if "<reasoning>" in answer and "</reasoning>" in answer:
             reasoning_start = answer.index("<reasoning>") + len("<reasoning>")
             reasoning_end = answer.index("</reasoning>")
             results["reasoning"] = answer[reasoning_start:reasoning_end].strip()
 
 
-        if "<hypothesis>" not in answer or "</hypothesis>" not in answer:
-            append_event(Event(
-                level="WARNING",
-                message="<issing required tag: <hypothesis>"
-            ))
-        else:
+        if "<hypothesis>" in answer and "</hypothesis>" in answer:
             hypothesis_start = answer.index("<hypothesis>") + len("<hypothesis>")
             hypothesis_end = answer.index("</hypothesis>")
             results["hypothesis"] = answer[hypothesis_start:hypothesis_end].strip()
 
         if "<test_driver>" not in answer or "</test_driver>" not in answer:
-            append_event(Event(
-                level="ERROR",
-                message="LLM response is missing required tag: <test_driver>"
-            ))
             return None
 
         try:
@@ -203,48 +198,31 @@ Target function (s) are defined in the following class:
             results["specification"] = specification
 
         except ValueError as e:
-            append_event(Event(
-                level="ERROR",
-                message=f"Error while parsing LLM response: {e}"
-            ))
             return None
 
         return results
 
-    def check_valid(self, parsed_response: str, func_name: str) -> bool:
+    def check_valid(self, parsed_response: str, pkg_name: str = "pkg") -> bool:
         specification = parsed_response["specification"]
         if "# Source Code of target function(s)" not in specification or "# Specification" not in specification:
-            append_event(Event(
-                level="DEBUG",
-                message="Specification is missing required sections."
-            ))
             return False
 
         test_driver = specification.split("# Specification")[1].strip()
-        pre_function_name = "pre_" + func_name
-        post_function_name = "post_" + func_name
-        if pre_function_name not in test_driver or post_function_name not in test_driver:
-            append_event(Event(
-                level="DEBUG",
-                message="Test driver did not call to the target function(s) directly."
-            ))
-            return False
+        return _loader_check_valid(test_driver, pkg_name=pkg_name)
 
-        append_event(Event(
-            level="DEBUG",
-            message="Specification passed basic validity checks."
-        ))
-        return True
-
-    def insert_code(self, prev_fut_code: str, post_fut_code: str, specification: str, available_import: str = "") -> str:
+    def insert_code(
+        self,
+        prev_fut_code: str,
+        post_fut_code: str,
+        specification: str,
+        available_import: str = "",
+        loader_header: str = "",
+    ) -> str:
         """
         Inserts concrete function code into the specification.
         """
+        specification = strip_loader_header(specification)
         if "# Source Code of target function(s)" not in specification or "# Specification" not in specification:
-            append_event(Event(
-                level="ERROR",
-                message="Specification is missing required sections."
-            ))
             return None
 
         import_part = specification.split("# Source Code of target function(s)")[0].strip()
@@ -254,16 +232,10 @@ Target function (s) are defined in the following class:
         spec_part = specification.split("# Specification")[1].strip()
 
         completed_specification = f"""
-# Neccessary Imports
+{loader_header}# Neccessary Imports
 {import_part}
 
 # Source Code of target function(s)
-
-## Before Pull Request
-{prev_fut_code}
-
-## After Pull Request
-{post_fut_code}
 
 # Specification
 {spec_part}

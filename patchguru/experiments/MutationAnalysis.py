@@ -5,24 +5,42 @@ from patchguru.analysis.PRRetriever import get_repo
 from patchguru.execution.DockerExecutor import DockerExecutor
 from patchguru.utils.CodeMutation import generate_mutants, beautify_code
 from patchguru.utils.PythonCodeUtil import update_function_name
+from patchguru.utils.ResultsLayout import iter_function_dirs
 import termcolor
 import argparse
 import difflib
 from hashlib import blake2b
 
 def decorate(text, color=None, on_color=None, attrs=None):
-    termcolor.colored(text, color, on_color, attrs)
+    return termcolor.colored(text, color, on_color, attrs)
 
-def extract_fut_code(fut_info, pre_fix = None):
-    assert len(fut_info.items()) == 1, "Only single function change is supported in this analysis."
-    fct_name, fct_info = list(fut_info.items())[0]
+class MultiFunctionError(Exception):
+    """Raised when a PR modifies more than one function."""
+    pass
+
+
+def extract_fut_code(fut_info, fct_name, pre_fix=None):
+    fct_info = fut_info[fct_name]
     code = fct_info['code']
     only_name = fct_name.split('.')[-1]
     if pre_fix:
         code = update_function_name(code, only_name, f"{pre_fix}{only_name}")
     return code
 
-def do_mutation(spec_path, result_dir, github_repo, pr_id , cloned_repo_manager, repo_name):
+
+def _resolve_single_fct_name(pr):
+    """Recover the sole modified function's name for old, pre-multi-function
+    cache trees that have no manifest.json to name it directly."""
+    modified = [name for name in pr.prev_fut_info if name in pr.post_fut_info]
+    if len(modified) != 1:
+        raise MultiFunctionError(
+            f"Only single function change is supported without a manifest.json. "
+            f"Found {len(modified)} functions: {modified}"
+        )
+    return modified[0]
+
+
+def do_mutation(spec_path, result_dir, github_repo, pr_id, cloned_repo_manager, repo_name, fct_name=None):
     os.makedirs(result_dir, exist_ok=True)
     with open(spec_path, "r") as f:
         spec = f.read()
@@ -30,26 +48,33 @@ def do_mutation(spec_path, result_dir, github_repo, pr_id , cloned_repo_manager,
     github_pr = github_repo.get_pull(pr_id)
     pr = PullRequest(github_pr, github_repo, cloned_repo_manager)
     commit = pr.pre_commit
-    cloned_repo = cloned_repo_manager.get_cloned_repo(commit)
+    cloned_repo = cloned_repo_manager.get_cloned_repo(pr.pre_commit, pr.post_commit)
     container_name = cloned_repo.container_name
     docker_executor = DockerExecutor(container_name)
 
-    post_fut_code_without_prefix = extract_fut_code(pr.post_fut_info)
-    pre_fut_code_without_prefix = extract_fut_code(pr.prev_fut_info)
+    try:
+        if fct_name is None:
+            fct_name = _resolve_single_fct_name(pr)
+        post_fut_code_without_prefix = extract_fut_code(pr.post_fut_info, fct_name)
+        pre_fut_code_without_prefix = extract_fut_code(pr.prev_fut_info, fct_name)
+    except MultiFunctionError as e:
+        print(f"Skipping PR {pr_id}: {e}")
+        return
     post_fut_code_without_prefix = beautify_code(post_fut_code_without_prefix)
     pre_fut_code_without_prefix = beautify_code(pre_fut_code_without_prefix)
-    diff = difflib.unified_diff(
-        pre_fut_code_without_prefix.splitlines(),
-        post_fut_code_without_prefix.splitlines(),
-        lineterm='',
-    )
-    added_lines = []
-    for line in diff:
-        if line.startswith('+') and not line.startswith('+++') and len(line.strip()) > 1:
-            added_lines.append(line[1:].strip())
+    pre_lines = pre_fut_code_without_prefix.splitlines()
+    post_lines = post_fut_code_without_prefix.splitlines()
+    matcher = difflib.SequenceMatcher(None, pre_lines, post_lines)
+    added_lines = set()
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag in ('insert', 'replace'):
+            for j in range(j1, j2):
+                line_text = post_lines[j]
+                if len(line_text.strip()) > 1:
+                    added_lines.add((j, line_text))
 
-    post_fut_code = extract_fut_code(pr.post_fut_info, pre_fix="post_")
-    pre_fut_code = extract_fut_code(pr.prev_fut_info, pre_fix="pre_")
+    post_fut_code = beautify_code(extract_fut_code(pr.post_fut_info, fct_name, pre_fix="post_"))
+    pre_fut_code = beautify_code(extract_fut_code(pr.prev_fut_info, fct_name, pre_fix="pre_"))
 
 
     before = spec.split("## Before Pull Request")[0]
@@ -76,17 +101,18 @@ def do_mutation(spec_path, result_dir, github_repo, pr_id , cloned_repo_manager,
     else:
         execution_results = {}
     for idx, mutant in enumerate(mutants):
-        diff = difflib.unified_diff(
-            post_fut_code.splitlines(),
-            mutant.splitlines(),
-            lineterm='',
-        )
-        removed_lines = []
-        for line in diff:
-            if line.startswith('-') and not line.startswith('---') and len(line.strip()) > 1:
-                removed_lines.append(line[1:].strip())
+        post_lines_with_prefix = post_fut_code.splitlines()
+        mutant_lines = mutant.splitlines()
+        matcher2 = difflib.SequenceMatcher(None, post_lines_with_prefix, mutant_lines)
+        removed_lines = set()
+        for tag, i1, i2, _j1, _j2 in matcher2.get_opcodes():
+            if tag in ('delete', 'replace'):
+                for i in range(i1, i2):
+                    line_text = post_lines_with_prefix[i]
+                    if len(line_text.strip()) > 1:
+                        removed_lines.add((i, line_text))
 
-        is_relevant = any(removed_line in added_lines for removed_line in removed_lines)
+        is_relevant = bool({i for i, _ in removed_lines} & {i for i, _ in added_lines})
         if is_relevant:
             hash_id = blake2b(mutant.encode()).hexdigest()
             if hash_id in execution_results:
@@ -137,36 +163,49 @@ def main(repo_name, analysis_result_dir):
     target_pr_ids = sorted(target_pr_ids)
     github_repo, cloned_repo_manager = get_repo(repo_name)
     for pr_id in target_pr_ids:
-        if pr_id >= 2244:
-            continue
-        phase1_spec_path = os.path.join(analysis_result_dir, str(pr_id), "specification.py")
-        phase2_spec_path = os.path.join(analysis_result_dir, str(pr_id), "phase2", "specification.py")
-        if os.path.exists(phase1_spec_path):
-            spec_path = phase1_spec_path
-            result_dir = os.path.join(".cache", "mutation_testing", "patchguru", repo_name, str(pr_id))
-            analysis_result_path = os.path.join(analysis_result_dir, str(pr_id), "results.json")
-            with open(analysis_result_path) as f:
-                analysis_result = json.load(f)
-            if "stage" not in analysis_result or analysis_result["stage"] != "completed":
-                print(f"Skipping PR {pr_id} mutation analysis due to incomplete analysis.")
-                continue
-            do_mutation(spec_path, result_dir, github_repo, pr_id, cloned_repo_manager, repo_name)
+        pr_dir = os.path.join(analysis_result_dir, str(pr_id))
+        # A PR now runs one independent oracle per modified function (see
+        # utils/ResultsLayout.py); each function gets its own subdirectory
+        # under pr_dir, so mutation analysis runs once per function too.
+        # `fct_name` is None for old, pre-multi-function flat cache trees.
+        for fct_name, fct_dir in iter_function_dirs(pr_dir):
+            fct_label = fct_name.replace(".", "__") if fct_name else None
+            result_pr_dir = (
+                os.path.join(".cache", "mutation_testing", repo_name, "patchguru", str(pr_id))
+                if fct_label is None
+                else os.path.join(".cache", "mutation_testing", repo_name, "patchguru", str(pr_id), fct_label)
+            )
 
-        if os.path.exists(phase2_spec_path):
-            spec_path = phase2_spec_path
-            result_dir = os.path.join(".cache", "mutation_testing", "patchguru", repo_name, str(pr_id), "phase2")
-            analysis_result_path = os.path.join(analysis_result_dir, str(pr_id), "phase2", "results.json")
-            with open(analysis_result_path) as f:
-                analysis_result = json.load(f)
-            if "stage" not in analysis_result or analysis_result["stage"] != "completed":
-                print(f"Skipping PR {pr_id} phase2 mutation analysis due to incomplete analysis.")
-                continue
-            do_mutation(spec_path, result_dir, github_repo, pr_id, cloned_repo_manager, repo_name)
+            phase1_spec_path = os.path.join(fct_dir, "specification.py")
+            phase2_spec_path = os.path.join(fct_dir, "phase2", "specification.py")
+
+            if os.path.exists(phase1_spec_path):
+                spec_path = phase1_spec_path
+                result_dir = result_pr_dir
+                analysis_result_path = os.path.join(fct_dir, "results.json")
+                with open(analysis_result_path) as f:
+                    analysis_result = json.load(f)
+                if "stage" not in analysis_result or analysis_result["stage"] != "completed":
+                    print(f"Skipping PR {pr_id} ({fct_name or 'single-function'}) mutation analysis due to incomplete analysis.")
+                    continue
+                do_mutation(spec_path, result_dir, github_repo, pr_id, cloned_repo_manager, repo_name, fct_name)
+
+            if os.path.exists(phase2_spec_path):
+                spec_path = phase2_spec_path
+                result_dir = os.path.join(result_pr_dir, "phase2")
+                analysis_result_path = os.path.join(fct_dir, "phase2", "results.json")
+                with open(analysis_result_path) as f:
+                    analysis_result = json.load(f)
+                if "stage" not in analysis_result or analysis_result["stage"] != "completed":
+                    print(f"Skipping PR {pr_id} ({fct_name or 'single-function'}) phase2 mutation analysis due to incomplete analysis.")
+                    continue
+                do_mutation(spec_path, result_dir, github_repo, pr_id, cloned_repo_manager, repo_name, fct_name)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Mutation analysis for a given repo")
     parser.add_argument("--repo", type=str, required=True, help="Repository name (e.g., pandas)")
-    parser.add_argument("--result_dir", type=str, required=True, help="Directory to store results")
+    parser.add_argument("--result_dir", type=str, default=None, help="Directory containing PatchGuru analysis results (default: .cache/oracles/<repo>)")
     args = parser.parse_args()
-    main(args.repo, args.result_dir)
+    result_dir = args.result_dir or os.path.join(".cache", "oracles", args.repo)
+    main(args.repo, result_dir)

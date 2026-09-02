@@ -23,7 +23,7 @@ def bug_injection(project, pr_number, max_injected_bugs=3):
     start_line = fut_info["start_line"]
     end_line = fut_info["end_line"]
     code = fut_info["code"]
-    cloned_repo = cloned_repo_manager.get_cloned_repo(pr.post_commit)
+    cloned_repo = cloned_repo_manager.get_cloned_repo(pr.pre_commit, pr.post_commit)
     container_name = cloned_repo.container_name
     print(cloned_repo_manager.repo_path)
 

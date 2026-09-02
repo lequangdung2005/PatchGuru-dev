@@ -1,4 +1,6 @@
-from patchguru.utils.Tracker import Event, append_event
+from patchguru.utils.LoaderHeader import check_valid as _loader_check_valid
+from patchguru.utils.LoaderHeader import strip_loader_header
+
 
 class SelfReviewPrompt:
     def __init__(self):
@@ -79,7 +81,7 @@ Provide your response in the following format:
 </conclusion>
 
 <test_driver>
-[Put the corrected test driver here if you concluded "MISMATCH". Make sure that fixed code is structurally similar to the input code. The fixed code should still contain three main sections: "# Neccessary imports", "# Specification", and "# Source Code of target function(s)". You can assume that the "# Source Code of target function(s)" section is unchanged and do not need to provide it again in your response. But you should still include the section header "# Source Code of target function(s)" between # Neccessary imports and # Specification sections in your response. If you concluded "BUG", you MUST leave this section empty.]
+[Put the corrected test driver here if you concluded "MISMATCH". Make sure that fixed code is structurally similar to the input code. The fixed code should still contain three main sections: "# Neccessary imports", "# Specification", and "# Source Code of target function(s)". You can assume that the "# Source Code of target function(s)" section is unchanged and do not need to provide it again in your response. But you should still include the section header "# Source Code of target function(s)" between # Neccessary imports and # Specification sections in your response. Calls to the target function(s) must go through the pre-loaded `pre_<pkg>`/`post_<pkg>` namespaces using their real, unmodified names (e.g., `pre_<pkg>.calculate_sum(...)` / `post_<pkg>.calculate_sum(...)`) -- do not rename the functions or drop the namespace prefix. If you concluded "BUG", you MUST leave this section empty.]
 </test_driver>
         """
         if len(enclosing_class) > 0:
@@ -108,28 +110,15 @@ Target function (s) are defined in the following class:
 
     def parse_answer(self, answer):
         results = {}
-        if "<reasoning>" not in answer or "</reasoning>" not in answer:
-            append_event(Event(
-                level="WARNING",
-                message="Missing required tag: <reasoning>"
-            ))
-        else:
+        if "<reasoning>" in answer and "</reasoning>" in answer:
             reasoning_start = answer.index("<reasoning>") + len("<reasoning>")
             reasoning_end = answer.index("</reasoning>")
             results["reasoning"] = answer[reasoning_start:reasoning_end].strip()
 
         if "<conclusion>" not in answer or "</conclusion>" not in answer:
-            append_event(Event(
-                level="ERROR",
-                message="Missing required tag: <conclusion>"
-            ))
             return None
 
         if "<test_driver>" not in answer or "</test_driver>" not in answer:
-            append_event(Event(
-                level="ERROR",
-                message="LLM response is missing required tag: <test_driver>"
-            ))
             return None
 
         try:
@@ -149,47 +138,22 @@ Target function (s) are defined in the following class:
             results["specification"] = specification
 
         except ValueError as e:
-            append_event(Event(
-                level="ERROR",
-                message=f"Error while parsing LLM response: {e}"
-            ))
             return None
 
         return results
 
-    def check_valid(self, parsed_response, func_name):
+    def check_valid(self, parsed_response, pkg_name: str = "pkg"):
         conclusion = parsed_response["conclusion"]
         if conclusion not in ["BUG", "MISMATCH"]:
-            append_event(Event(
-                level="DEBUG",
-                message="Conclusion is not valid. It should be either 'BUG' or 'MISMATCH'."
-            ))
             return False
         if conclusion == "BUG":
             return True
 
         specification = parsed_response["specification"]
         if "# Source Code of target function(s)" not in specification or "# Specification" not in specification:
-            append_event(Event(
-                level="DEBUG",
-                message="Specification is missing required sections."
-            ))
             return False
         test_driver = specification.split("# Specification")[1].strip()
-        pre_function_name = "pre_" + func_name
-        post_function_name = "post_" + func_name
-        if pre_function_name not in test_driver or post_function_name not in test_driver:
-            append_event(Event(
-                level="DEBUG",
-                message="Test driver did not call to the target function(s) directly."
-            ))
-            return False
-
-        append_event(Event(
-            level="DEBUG",
-            message="Specification passed basic validity checks."
-        ))
-        return True
+        return _loader_check_valid(test_driver, pkg_name=pkg_name)
 
     def hidden_post_pr_code(self, code):
         assert "## After Pull Request" in code, "The provided code does not contain the expected section header '# After Pull Request'."
@@ -206,30 +170,21 @@ Target function (s) are defined in the following class:
 """
         return new_code
 
-    def insert_code(self, prev_fut_code, post_fut_code, specification):
+    def insert_code(self, prev_fut_code, post_fut_code, specification, loader_header: str = ""):
         """
         Inserts concrete function code into the specification.
         """
+        specification = strip_loader_header(specification)
         if "# Source Code of target function(s)" not in specification or "# Specification" not in specification:
-            append_event(Event(
-                level="ERROR",
-                message="Specification format is incorrect. Missing required sections."
-            ))
             return None
 
         import_part = specification.split("# Source Code of target function(s)")[0].strip()
         spec_part = specification.split("# Specification")[1].strip()
 
         completed_specification = f"""
-{import_part}
+{loader_header}{import_part}
 
 # Source Code of target function(s)
-
-## Before Pull Request
-{prev_fut_code}
-
-## After Pull Request
-{post_fut_code}
 
 # Specification
 {spec_part}
